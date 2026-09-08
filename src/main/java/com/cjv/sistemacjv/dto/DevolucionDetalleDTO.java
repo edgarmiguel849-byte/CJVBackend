@@ -1,0 +1,94 @@
+package com.cjv.sistemacjv.dto;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+/**
+ * Un renglón del detalle de devoluciones del periodo (RN-11).
+ *
+ * Sirve para contestar la pregunta "¿por qué a esta vendedora le bajó
+ * la comisión?": cada devolución aparece con su fecha, su folio Z, el
+ * alumno al que se le regresó el dinero, a qué destinatario le pegó
+ * y el motivo que capturó el mostrador.
+ *
+ * El monto va en POSITIVO. En la base de datos vive en negativo, pero
+ * aquí es un número para leer en una tabla, no para volver a sumar.
+ */
+public class DevolucionDetalleDTO {
+
+    private LocalDate fecha;
+    private String folio;            // siempre de la serie Z
+    private String alumno;
+    private String escuela;          // carrera de la O.T., o "ADICIONAL"
+    private BigDecimal monto;        // en positivo
+    private String modalidad;        // por dónde salió el dinero
+    private String destinatario;     // vendedora afectada, u "Oficina"
+    private String motivo;           // los comentarios de la devolución
+
+    public DevolucionDetalleDTO() {
+    }
+
+    public LocalDate getFecha() {
+        return fecha;
+    }
+
+    public void setFecha(LocalDate fecha) {
+        this.fecha = fecha;
+    }
+
+    public String getFolio() {
+        return folio;
+    }
+
+    public void setFolio(String folio) {
+        this.folio = folio;
+    }
+
+    public String getAlumno() {
+        return alumno;
+    }
+
+    public void setAlumno(String alumno) {
+        this.alumno = alumno;
+    }
+
+    public String getEscuela() {
+        return escuela;
+    }
+
+    public void setEscuela(String escuela) {
+        this.escuela = escuela;
+    }
+
+    public BigDecimal getMonto() {
+        return monto;
+    }
+
+    public void setMonto(BigDecimal monto) {
+        this.monto = monto;
+    }
+
+    public String getModalidad() {
+        return modalidad;
+    }
+
+    public void setModalidad(String modalidad) {
+        this.modalidad = modalidad;
+    }
+
+    public String getDestinatario() {
+        return destinatario;
+    }
+
+    public void setDestinatario(String destinatario) {
+        this.destinatario = destinatario;
+    }
+
+    public String getMotivo() {
+        return motivo;
+    }
+
+    public void setMotivo(String motivo) {
+        this.motivo = motivo;
+    }
+}
