@@ -296,8 +296,13 @@ public class EgresoService {
     }
 
     /**
-     * Un día está TRABADO cuando tiene cierre de caja y ese cierre no está
-     * REABIERTO.
+     * Un día está TRABADO cuando tiene al menos un corte y ese corte no
+     * está REABIERTO.
+     *
+     * Se pregunta por TODOS los cortes de la fecha, no por uno solo: un día
+     * puede tener varios (cada persona entrega el suyo, y el Administrativo
+     * puede hacer más de uno). Con un solo corte por día — como hoy — el
+     * resultado es idéntico al de antes.
      *
      * Qué estados traban NO se decide aquí: se le pregunta a
      * CierreCajaService.estadoTrabaElDia(), para que esa regla exista
@@ -308,13 +313,18 @@ public class EgresoService {
             return false;
         }
 
-        Optional<CierreCaja> cierre = cierreCajaRepository.findByFechaCierre(fecha);
+        List<CierreCaja> cortes =
+                cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
 
-        if (cierre.isEmpty()) {
+        if (cortes.isEmpty()) {
             return false; // ese día no tiene corte: está abierto.
         }
 
-        return CierreCajaService.estadoTrabaElDia(cierre.get().getEstado());
+        // Basta con que UN corte trabe para que el día esté trabado.
+        // En el paso 3 esta regla se afina para que cada quien se trabe
+        // únicamente con el suyo.
+        return cortes.stream()
+                .anyMatch(corte -> CierreCajaService.estadoTrabaElDia(corte.getEstado()));
     }
 
     /**

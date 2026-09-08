@@ -439,13 +439,19 @@ public class PagoService {
             return false;
         }
 
-        Optional<CierreCaja> cierre = cierreCajaRepository.findByFechaCierre(fecha);
+        List<CierreCaja> cortes =
+                cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
 
-        if (cierre.isEmpty()) {
+        if (cortes.isEmpty()) {
             return false; // ese día no tiene corte: está abierto.
         }
 
-        return CierreCajaService.estadoTrabaElDia(cierre.get().getEstado());
+        // Basta con que UN corte trabe para que el día esté trabado.
+        // Mientras haya un solo corte por día, esto se comporta EXACTAMENTE
+        // igual que antes. Cuando existan varios (paso 3), esta regla se
+        // afina para que cada quien se trabe únicamente con el suyo.
+        return cortes.stream()
+                .anyMatch(corte -> CierreCajaService.estadoTrabaElDia(corte.getEstado()));
     }
 
     /**
