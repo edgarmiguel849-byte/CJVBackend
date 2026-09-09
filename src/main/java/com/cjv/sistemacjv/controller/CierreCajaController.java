@@ -108,13 +108,6 @@ public class CierreCajaController {
                 .orElse(ResponseEntity.noContent().build());
     }
 
-    @GetMapping("/{id}")
-    public ResponseEntity<CierreCaja> buscarCierreCajaPorId(@PathVariable Integer id) {
-        return cierreCajaService.buscarPorId(id)
-                .map(ResponseEntity::ok)
-                .orElse(ResponseEntity.notFound().build());
-    }
-
     /**
      * Entrego MI corte con el efectivo que conté.
      * El servidor recalcula lo esperado; el navegador solo manda lo contado.
@@ -157,6 +150,23 @@ public class CierreCajaController {
         }
 
         return ResponseEntity.notFound().build();
+    }
+
+    /**
+     * VA HASTA ABAJO A PROPÓSITO, no lo muevas para arriba.
+     *
+     * "/{id}" se traga CUALQUIER texto que venga después de la diagonal.
+     * Spring resuelve por orden de declaración, así que con esta ruta
+     * arriba, una petición a /mi-corte cae AQUÍ e intenta convertir
+     * "mi-corte" a Integer -> 400 "For input string: mi-corte".
+     *
+     * Regla: las rutas con nombre fijo van ANTES que las de comodín.
+     */
+    @GetMapping("/{id}")
+    public ResponseEntity<CierreCaja> buscarCierreCajaPorId(@PathVariable Integer id) {
+        return cierreCajaService.buscarPorId(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
     }
 
     /**
