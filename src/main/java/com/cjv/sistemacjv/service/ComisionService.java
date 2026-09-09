@@ -1,15 +1,19 @@
 package com.cjv.sistemacjv.service;
 
+import com.cjv.sistemacjv.dto.CorteDePersonaDTO;
 import com.cjv.sistemacjv.dto.FilaComisionDTO;
 import com.cjv.sistemacjv.dto.MovimientoDetalleDTO;
 import com.cjv.sistemacjv.dto.RenglonCorteDTO;
 import com.cjv.sistemacjv.dto.ReporteComisionesDTO;
 import com.cjv.sistemacjv.dto.TotalPorModalidadDTO;
 import com.cjv.sistemacjv.entity.Contrato;
+import com.cjv.sistemacjv.entity.Egreso;
 import com.cjv.sistemacjv.entity.OrdenTrabajo;
 import com.cjv.sistemacjv.entity.Pago;
 import com.cjv.sistemacjv.entity.Vendedor;
+import com.cjv.sistemacjv.repository.CierreCajaRepository;
 import com.cjv.sistemacjv.repository.ContratoRepository;
+import com.cjv.sistemacjv.repository.EgresoRepository;
 import com.cjv.sistemacjv.repository.PagoRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -67,6 +71,17 @@ public class ComisionService {
 
     @Autowired
     private ContratoRepository contratoRepository;
+
+    @Autowired
+    private EgresoRepository egresoRepository;
+
+    /**
+     * Se usa SOLO para preguntar si un movimiento ya está dentro de un corte
+     * entregado. Es la diferencia entre el reporte del Jefe (que ve todo el
+     * día) y el corte individual (que solo se lleva lo que falta cortar).
+     */
+    @Autowired
+    private CierreCajaRepository cierreCajaRepository;
 
     /**
      * Estructura interna para ir acumulando por destinatario mientras recorremos
@@ -274,6 +289,194 @@ public class ComisionService {
         Vendedor vendedora = forzarOficina ? null : obtenerVendedora(contrato);
         d.setDestinatario(vendedora != null ? vendedora.getNombre() : "Oficina");
         return d;
+    }
+
+    // ===================== CORTE DE UNA PERSONA =====================
+
+    /**
+     * El corte de UNA persona en UN día: lo que ella recibió y que todavía
+     * no ha entregado en ningún corte.
+     *
+     * NO usa generar() ni detallar() a propósito. Esos dos alimentan el
+     * reporte del Jefe, que ve el día completo de todos, y meterles un
+     * filtro por persona los haría mostrar menos dinero sin que nada
+     * truene. Este método vive aparte para que esos dos queden intactos.
+     *
+     * Aquí NO hay comisiones: la comisión es de la VENDEDORA de la O.T.,
+     * y esta hoja es de quien RECIBIÓ el dinero. Son personas distintas.
+     *
+     * Lo que ya está en un corte entregado se salta. Por eso el segundo
+     * corte del día del Administrativo no vuelve a barrer lo del primero.
+     */
+    public CorteDePersonaDTO generarCorteDePersona(LocalDate fecha,
+                                                   Integer idUsuario,
+                                                   String nombreUsuario) {
+        if (fecha == null) {
+            throw new IllegalArgumentException("Debes indicar la fecha del corte.");
+        }
+        if (idUsuario == null) {
+            throw new IllegalArgumentException("Debes indicar de quién es el corte.");
+        }
+
+        CorteDePersonaDTO corte = new CorteDePersonaDTO();
+        corte.setFecha(fecha);
+        corte.setIdUsuario(idUsuario);
+        corte.setNombreUsuario(nombreUsuario);
+
+        BigDecimal totalEfectivo = BigDecimal.ZERO;
+        BigDecimal totalNoEfectivo = BigDecimal.ZERO;
+        BigDecimal totalCortesias = BigDecimal.ZERO;
+        BigDecimal totalIngresos = BigDecimal.ZERO;
+        BigDecimal totalDevoluciones = BigDecimal.ZERO;
+        BigDecimal totalEgresos = BigDecimal.ZERO;
+
+        List<RenglonCorteDTO> renglones = new ArrayList<>();
+        List<Egreso> egresosDelCorte = new ArrayList<>();
+        List<Integer> idsPagos = new ArrayList<>();
+        List<Integer> idsContratos = new ArrayList<>();
+        List<Integer> idsEgresos = new ArrayList<>();
+
+        // ---------- 1) ANTICIPOS de contratos que ELLA capturó ----------
+        List<Contrato> contratos = contratoRepository
+                .findByActivoTrueAndFechaContratoAndUsuario_IdUsuarioOrderByIdContratoAsc(
+                        fecha, idUsuario);
+
+        for (Contrato contrato : contratos) {
+            BigDecimal anticipo = contrato.getAnticipo() != null
+                    ? contrato.getAnticipo() : BigDecimal.ZERO;
+            if (anticipo.compareTo(BigDecimal.ZERO) == 0) {
+                continue;
+            }
+            // Ya viajó en un corte anterior: no se cuenta dos veces.
+            if (cierreCajaRepository.contratoEstaEnCorteQueTraba(contrato.getIdContrato())) {
+                continue;
+            }
+
+            String modalidad = nombreModalidad(contrato.getModoAnticipo());
+
+            RenglonCorteDTO r = new RenglonCorteDTO();
+            r.setFolioContrato(contrato.getFolio());
+            r.setFolioRecibo(null);
+            r.setNombre(nombreAlumno(contrato));
+            r.setEscuela(nombreEscuela(contrato));
+            r.setMonto(anticipo);
+            r.setModalidad(modalidad);
+            r.setEsEfectivo(esEfectivo(contrato.getModoAnticipo()));
+            r.setCancelado(esCancelado(contrato));
+
+            totalIngresos = totalIngresos.add(anticipo);
+            idsContratos.add(contrato.getIdContrato());
+
+            if (esCortesia(contrato.getModoAnticipo())) {
+                r.setEsCortesia(true);
+                r.setIdDestinatario(null);
+                r.setNombreDestinatario("Cortesía");
+                totalCortesias = totalCortesias.add(anticipo);
+                renglones.add(r);
+                continue;   // una cortesía no es dinero: no toca los totales
+            }
+
+            asignarDestinatario(r, contrato);
+            renglones.add(r);
+
+            if (esEfectivo(contrato.getModoAnticipo())) {
+                totalEfectivo = totalEfectivo.add(anticipo);
+            } else {
+                totalNoEfectivo = totalNoEfectivo.add(anticipo);
+            }
+        }
+
+        // ---------- 2) PAGOS que ELLA cobró ----------
+        List<Pago> pagos = pagoRepository
+                .findByActivoTrueAndFechaPagoAndUsuario_IdUsuarioOrderByIdPagoAsc(
+                        fecha, idUsuario);
+
+        for (Pago pago : pagos) {
+            if (cierreCajaRepository.pagoEstaEnCorteQueTraba(pago.getIdPago())) {
+                continue;
+            }
+
+            Contrato contrato = pago.getContrato();
+            BigDecimal monto = pago.getMontoPago() != null
+                    ? pago.getMontoPago() : BigDecimal.ZERO;
+            String modalidad = nombreModalidad(pago.getModoPago());
+
+            RenglonCorteDTO r = new RenglonCorteDTO();
+            r.setFolioContrato(null);
+            r.setFolioRecibo(pago.getFolio());
+            r.setNombre(nombreAlumno(contrato));
+            r.setEscuela(nombreEscuela(contrato));
+            r.setMonto(monto);
+            r.setModalidad(modalidad);
+            r.setEsEfectivo(esEfectivo(pago.getModoPago()));
+            r.setCancelado(esCancelado(contrato));
+            r.setEsDevolucion(pago.esDevolucion());
+
+            idsPagos.add(pago.getIdPago());
+
+            if (monto.compareTo(BigDecimal.ZERO) < 0) {
+                // Devolución: se acumula en positivo para leerla, pero el
+                // monto negativo baja solo el efectivo más abajo.
+                totalDevoluciones = totalDevoluciones.add(monto.abs());
+            } else {
+                totalIngresos = totalIngresos.add(monto);
+            }
+
+            if (esCortesia(pago.getModoPago())) {
+                r.setEsCortesia(true);
+                r.setIdDestinatario(null);
+                r.setNombreDestinatario("Cortesía");
+                totalCortesias = totalCortesias.add(monto);
+                renglones.add(r);
+                continue;
+            }
+
+            asignarDestinatario(r, contrato, pago.esComisionOficina());
+            renglones.add(r);
+
+            if (esEfectivo(pago.getModoPago())) {
+                totalEfectivo = totalEfectivo.add(monto);
+            } else {
+                totalNoEfectivo = totalNoEfectivo.add(monto);
+            }
+        }
+
+        // ---------- 3) EGRESOS que ELLA capturó ----------
+        List<Egreso> egresos = egresoRepository
+                .findByActivoTrueAndFechaEgresoAndUsuario_IdUsuarioOrderByIdEgresoAsc(
+                        fecha, idUsuario);
+
+        for (Egreso egreso : egresos) {
+            if (cierreCajaRepository.egresoEstaEnCorteQueTraba(egreso.getIdEgreso())) {
+                continue;
+            }
+            BigDecimal monto = egreso.getMonto() != null
+                    ? egreso.getMonto() : BigDecimal.ZERO;
+
+            totalEgresos = totalEgresos.add(monto);
+            egresosDelCorte.add(egreso);
+            idsEgresos.add(egreso.getIdEgreso());
+        }
+
+        // Lo que debe haber en SU cajón: lo que entró en billetes menos lo
+        // que sacó. Las devoluciones no se restan aparte porque su monto ya
+        // venía en negativo y bajó el efectivo al sumarse.
+        BigDecimal efectivoEnCaja = totalEfectivo.subtract(totalEgresos);
+
+        corte.setTotalEfectivo(totalEfectivo);
+        corte.setTotalNoEfectivo(totalNoEfectivo);
+        corte.setTotalCortesias(totalCortesias);
+        corte.setTotalDevoluciones(totalDevoluciones);
+        corte.setTotalIngresos(totalIngresos);
+        corte.setTotalEgresos(totalEgresos);
+        corte.setEfectivoEnCaja(efectivoEnCaja);
+        corte.setRenglones(renglones);
+        corte.setEgresos(egresosDelCorte);
+        corte.setIdsPagos(idsPagos);
+        corte.setIdsContratos(idsContratos);
+        corte.setIdsEgresos(idsEgresos);
+
+        return corte;
     }
 
     /** Suma un monto al desglose por modalidad y cuenta el recibo. */
