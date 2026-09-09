@@ -70,6 +70,7 @@ public class ContratoService {
     private final PagoRepository pagoRepository;
     private final PaqueteRepository paqueteRepository;
     private final CierreCajaRepository cierreCajaRepository;
+    private final CierreCajaService cierreCajaService;
     private final EstadoContratoRepository estadoContratoRepository;
     private final OrdenTrabajoRepository ordenTrabajoRepository;
     private final BitacoraLogger bitacoraLogger;
@@ -80,6 +81,7 @@ public class ContratoService {
                            PagoRepository pagoRepository,
                            PaqueteRepository paqueteRepository,
                            CierreCajaRepository cierreCajaRepository,
+                           CierreCajaService cierreCajaService,
                            EstadoContratoRepository estadoContratoRepository,
                            OrdenTrabajoRepository ordenTrabajoRepository,
                            BitacoraLogger bitacoraLogger,
@@ -89,6 +91,7 @@ public class ContratoService {
         this.pagoRepository = pagoRepository;
         this.paqueteRepository = paqueteRepository;
         this.cierreCajaRepository = cierreCajaRepository;
+        this.cierreCajaService = cierreCajaService;
         this.estadoContratoRepository = estadoContratoRepository;
         this.ordenTrabajoRepository = ordenTrabajoRepository;
         this.bitacoraLogger = bitacoraLogger;
@@ -145,13 +148,12 @@ public class ContratoService {
     public Contrato guardarContrato(Contrato contrato) {
 
         // ===== CANDADO DE CREACIÓN (regla de roles + corte de caja) =====
-        // Faltaba: actualizar y eliminar sí lo tenían, crear no.
         // Importa porque ComisionService levanta los anticipos por FECHA
         // DEL CONTRATO. Un contrato capturado hoy con fecha de la semana
         // pasada le mete su anticipo a un corte ya firmado.
         //
         // Devuelve true cuando un ADMINISTRADOR está capturando en un día
-        // trabado: no se le detiene, pero queda anotado.
+        // donde él ya entregó corte: no se le detiene, pero queda anotado.
         boolean avisoDiaTrabado = verificarPermisoCrear(contrato);
         // ================================================================
 
@@ -187,7 +189,7 @@ public class ContratoService {
                         + " - " + describirOrigen(guardado)
                         + (avisoDiaTrabado
                         ? " - AVISO: capturado con fecha " + guardado.getFechaContrato()
-                          + ", día con corte ya entregado"
+                          + ", día donde ya entregó su corte"
                         : "")
         );
 
@@ -198,11 +200,15 @@ public class ContratoService {
     public Optional<Contrato> actualizarContrato(Integer id, Contrato datosContrato) {
         return contratoRepository.findById(id).map(contrato -> {
 
-            // ===== CANDADO DE EDICIÓN (regla de roles + corte de caja) =====
-            // Mostrador solo puede editar si el día del contrato NO está
-            // trabado por el corte. Administrador y Jefe pueden siempre.
+            // ===== CANDADO DE EDICIÓN =====
+            // Dos preguntas distintas, las dos tienen que pasar:
+            //   1. ¿Este contrato YA viaja en un corte entregado?
+            //   2. ¿Puedo mover dinero a la fecha NUEVA? Sin esto, se
+            //      podría arrastrar un contrato de hoy a un día ya cortado.
             verificarPermisoModificar(contrato, "editar");
-            // ================================================================
+            verificarPuedoMoverDineroEn(datosContrato.getFechaContrato(),
+                    "mover a esa fecha");
+            // ==============================
 
             normalizarFolio(datosContrato);
             validarFolioUnico(datosContrato.getFolio(), id);
@@ -306,9 +312,9 @@ public class ContratoService {
 
         Contrato contrato = encontrado.get();
 
-        // ===== CANDADO DE ELIMINACIÓN (regla de roles + corte de caja) =====
+        // ===== CANDADO DE ELIMINACIÓN =====
         verificarPermisoModificar(contrato, "eliminar");
-        // ===================================================================
+        // ==================================
 
         // Los artículos se van con el contrato. La base también lo hace sola
         // (ON DELETE CASCADE), pero se borra aquí para que quede escrito.
@@ -346,8 +352,8 @@ public class ContratoService {
      * correcto y esconder los filtros de fecha cuando toca.
      *
      * Los modos:
-     *   SOLO_HOY       -> Mostrador con el día abierto: ve los de hoy.
-     *   CORTE_CERRADO  -> Mostrador con el corte de hoy ya entregado: no ve nada.
+     *   SOLO_HOY       -> Mostrador con su corte de hoy sin entregar.
+     *   CORTE_CERRADO  -> Mostrador que YA entregó su corte de hoy: no ve nada.
      *   BUSCAR_PRIMERO -> Administrador/Jefe: pantalla en blanco hasta buscar.
      *   SIN_ACCESO     -> rol desconocido: no ve nada, por seguridad.
      */
@@ -360,7 +366,7 @@ public class ContratoService {
         }
 
         if (ROL_MOSTRADOR.equals(rol)) {
-            boolean trabado = diaTrabado(hoy);
+            boolean trabado = yaEntregueMiCorte(hoy);
             return new ModoPantallaContratos(
                     trabado ? MODO_CORTE_CERRADO : MODO_SOLO_HOY,
                     rol, hoy, trabado);
@@ -376,7 +382,7 @@ public class ContratoService {
      * esconder botones en Angular es como poner una cortina; esto es la chapa.
      * Aunque alguien manipule la dirección del navegador, el servidor manda.
      *
-     *  - MOSTRADOR: si el corte de hoy está trabado -> no ve NADA.
+     *  - MOSTRADOR: si YA entregó su corte de hoy -> no ve NADA.
      *               Si no, se le FUERZAN las fechas a hoy-hoy, sin importar
      *               lo que haya pedido. Puede buscar texto, pero solo dentro
      *               de los contratos de hoy.
@@ -417,8 +423,8 @@ public class ContratoService {
         if (ROL_MOSTRADOR.equals(rol)) {
             LocalDate hoy = LocalDate.now();
 
-            // Corte del día ya entregado: no ve nada hasta que el jefe reabra.
-            if (diaTrabado(hoy)) {
+            // SU corte de hoy ya entregado: no ve nada hasta que el jefe reabra.
+            if (yaEntregueMiCorte(hoy)) {
                 return Page.<ContratoConSaldoDTO>empty(pageable);
             }
 
@@ -457,10 +463,7 @@ public class ContratoService {
      *
      * Se hizo un método aparte (en vez de meterle un parámetro al de grupos)
      * para NO arriesgar la pantalla de grupos, que ya quedó probada. Las reglas
-     * de quién-ve-qué son las MISMAS que en grupos:
-     *   - MOSTRADOR: si el corte de hoy está trabado -> no ve nada; si no, se le
-     *                fuerzan las fechas a hoy-hoy.
-     *   - ADMIN/JEFE: pantalla en blanco hasta que manden algún filtro.
+     * de quién-ve-qué son las MISMAS que en grupos.
      */
     public Page<ContratoConSaldoDTO> listarPaginadoAdicionales(String texto,
                                                                LocalDate desde,
@@ -494,7 +497,7 @@ public class ContratoService {
         // ---------- MOSTRADOR ----------
         if (ROL_MOSTRADOR.equals(rol)) {
             LocalDate hoy = LocalDate.now();
-            if (diaTrabado(hoy)) {
+            if (yaEntregueMiCorte(hoy)) {
                 return Page.<ContratoConSaldoDTO>empty(pageable);
             }
             desde = hoy;
@@ -552,15 +555,6 @@ public class ContratoService {
      * vence, el negocio lo recontrata como adicional. Un contrato VENCIDO
      * entra sin problema, porque "Vencido" no es un estado de la base: es
      * un letrero calculado y el contrato sigue Activo.
-     *
-     * Solo se bloquea si:
-     *   - no existe,
-     *   - está CANCELADO,
-     *   - ya fue recontratado antes (para no duplicar el arrastre),
-     *   - o fue dado de baja por un traspaso viejo.
-     *
-     * Devuelve el contrato con su saldo, para que la pantalla muestre el
-     * TOTAL histórico y lo ABONADO (que se propone como arrastre).
      */
     public ContratoConSaldoDTO buscarAnteriorParaTraspaso(String folio) {
         Contrato anterior = obtenerAnteriorValidado(folio);
@@ -635,11 +629,6 @@ public class ContratoService {
      *   Contrato anterior:
      *     sigue VIVO (activo = 1) y se queda en su O.T., pintado morado.
      *     traspasadoA = folio del nuevo.
-     *
-     * Sobre el arrastre: la pantalla lo propone con lo que el sistema tiene
-     * registrado, pero la persona lo puede corregir con el global de los
-     * recibos físicos, que es el papel que manda. Si no llega nada, se usa
-     * lo calculado.
      */
     @Transactional
     public Contrato traspasarAdicional(Contrato nuevo, String folioAnterior) {
@@ -720,11 +709,6 @@ public class ContratoService {
      *
      * El anticipo se queda en cero a propósito: el dinero no entra al
      * firmar el contrato (porque no se firma), entra como pago.
-     *
-     * @param idOrdenTrabajo la O.T. de la que cuelga el cobro.
-     * @param nombreAlumno   el nombre de la persona (obligatorio).
-     * @param total          monto que se va a cobrar.
-     * @param fecha          fecha del cobro.
      */
     @Transactional
     public Contrato crearContratoRenta(Integer idOrdenTrabajo,
@@ -762,10 +746,6 @@ public class ContratoService {
         // nacer sin estado. Nace "Pendiente de pago" y en cuanto PagoService
         // le cuelgue el pago, actualizarEstadoContrato() lo pasa solo a
         // "Pagado", porque el total es igual al monto del cobro.
-        //
-        // Se busca por NOMBRE y no por el id 1, igual que el paquete
-        // "General": si algún día se reinician los AUTO_INCREMENT, el
-        // número cambia pero el nombre no.
         EstadoContrato pendiente = estadoContratoRepository
                 .findByNombreEstado(NOMBRE_ESTADO_PENDIENTE)
                 .orElseThrow(() -> new RuntimeException(
@@ -777,10 +757,7 @@ public class ContratoService {
         contrato.setTotal(total);
         contrato.setAnticipo(BigDecimal.ZERO);
         // La entidad marca modoAnticipo como NOT NULL, así que no puede ir
-        // en null aunque el anticipo sea cero. Se pone "Efectivo" por ser
-        // el modo que ya usa el resto del sistema como valor de arranque;
-        // el dinero de verdad entra como pago, con su propio modo, y ese
-        // es el que cuenta para el corte.
+        // en null aunque el anticipo sea cero.
         contrato.setModoAnticipo("Efectivo");
         contrato.setAbonoHeredado(BigDecimal.ZERO);
         contrato.setActivo(true);
@@ -805,12 +782,12 @@ public class ContratoService {
         BigDecimal abonado = contrato.getAbonadoInicial().add(sumaPagos);
         BigDecimal resta = contrato.getTotal().subtract(abonado);
 
-        // ¿El día de este contrato está TRABADO por el corte?
+        // ¿Este contrato en concreto está CONGELADO por un corte?
         // (El nombre del campo sigue siendo 'diaConCorte' para no romper el
-        //  frontend, pero ahora significa "trabado": un día REABIERTO ya no
-        //  cuenta como trabado, aunque tenga cierre.)
-        boolean diaConCorte = contrato.getFechaContrato() != null
-                && diaTrabado(contrato.getFechaContrato());
+        //  frontend, pero ahora la pregunta ya no es por el día: es por este
+        //  contrato. Un día puede tener el corte de Tete entregado y el de
+        //  Adri abierto.)
+        boolean diaConCorte = movimientoCongelado(contrato);
 
         return new ContratoConSaldoDTO(contrato, abonado, resta, diaConCorte);
     }
@@ -818,45 +795,75 @@ public class ContratoService {
     // ===================== CANDADO DE PERMISOS =====================
 
     /**
-     * ¿Ese día está trabado para el mostrador?
+     * ¿Ya entregué YO mi corte de ese día?
      *
-     * Trabado = existe un cierre para esa fecha Y no está REABIERTO.
-     * O sea: ENVIADO o AUTORIZADO traban; REABIERTO destraba.
-     *
-     * La regla de qué estados traban vive en CierreCajaService, para que
-     * exista escrita en UN SOLO lugar en todo el sistema.
+     * Es la pregunta de la PERSONA. Sirve para movimientos que todavía no
+     * existen (crear) o que van a cambiar de fecha (mover). Que Adri haya
+     * entregado el suyo no detiene a Tete.
      */
-    private boolean diaTrabado(LocalDate fecha) {
+    private boolean yaEntregueMiCorte(LocalDate fecha) {
         if (fecha == null) {
             return false;
         }
+        Usuario yo = obtenerUsuarioLogueado();
+        return cierreCajaService.yaEntregoSuCorte(fecha, yo.getIdUsuario());
+    }
 
+    /**
+     * ¿Este contrato está congelado por un corte?
+     *
+     * Es la pregunta del MOVIMIENTO, y congela para CUALQUIER mostrador,
+     * no solo para su dueño: si Tete ya entregó ese contrato y firmó el
+     * papel, que Adri se lo cambie a las 6 le rompe el corte sin que ella
+     * se entere.
+     *
+     * AQUÍ VIVE LA FRONTERA:
+     *
+     *  - Contratos ANTERIORES al 9/09/2026 -> regla VIEJA, por fecha. Es la
+     *    única que los protege: nacieron antes de que existiera
+     *    cierre_caja_detalle y no tienen renglón ahí. Sin esto quedarían
+     *    descongelados de golpe, y entre ellos hay cobros reales.
+     *
+     *  - De esa fecha en adelante -> regla NUEVA, por renglón en el detalle.
+     */
+    private boolean movimientoCongelado(Contrato contrato) {
+        if (contrato == null || contrato.getFechaContrato() == null) {
+            return false;
+        }
+
+        if (contrato.getFechaContrato().isBefore(
+                CierreCajaService.INICIO_CORTES_POR_PERSONA)) {
+            return diaTrabadoReglaVieja(contrato.getFechaContrato());
+        }
+
+        return cierreCajaRepository.contratoEstaEnCorteQueTraba(contrato.getIdContrato());
+    }
+
+    /**
+     * La regla de antes: el día está trabado si tiene algún corte que trabe.
+     * Solo se usa para movimientos anteriores a la frontera.
+     */
+    private boolean diaTrabadoReglaVieja(LocalDate fecha) {
         List<CierreCaja> cortes =
                 cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
 
-        if (cortes.isEmpty()) {
-            return false; // ese día no tiene corte: está abierto.
-        }
-
-        // Basta con que UN corte trabe para que el día esté trabado.
-        // Mientras haya un solo corte por día, esto se comporta EXACTAMENTE
-        // igual que antes. Cuando existan varios (paso 3), esta regla se
-        // afina para que cada quien se trabe únicamente con el suyo.
         return cortes.stream()
                 .anyMatch(corte -> CierreCajaService.estadoTrabaElDia(corte.getEstado()));
     }
 
     /**
-     * Regla para CREAR un contrato, según la fecha con la que va a nacer:
+     * Regla para CREAR un contrato, según la fecha con la que va a nacer.
+     * Un contrato que no existe no puede estar en ningún corte, así que
+     * aquí la pregunta correcta es la de la PERSONA.
      *
      *  - JEFE          -> pasa, sin nota.
-     *  - ADMINISTRADOR -> pasa SIEMPRE, pero si el día está trabado se
-     *                     devuelve true para que quede anotado en bitácora.
-     *                     No se le bloquea a propósito: es quien captura el
-     *                     grueso de los recibos y detenerlo cada vez que
-     *                     tiene un pendiente atrasado terminaría en que
-     *                     capture todo con fecha de hoy, que es peor.
-     *  - MOSTRADOR     -> bloqueado si el día está trabado.
+     *  - ADMINISTRADOR -> pasa SIEMPRE, pero si ya entregó su corte de ese
+     *                     día se devuelve true para que quede anotado en
+     *                     bitácora. No se le bloquea a propósito: es quien
+     *                     captura el grueso de los recibos y detenerlo cada
+     *                     vez que tiene un pendiente atrasado terminaría en
+     *                     que capture todo con fecha de hoy, que es peor.
+     *  - MOSTRADOR     -> bloqueado si ya entregó su corte de ese día.
      *  - Desconocido   -> bloqueado.
      *
      * @return true solo si hay que dejar la nota de aviso.
@@ -864,21 +871,20 @@ public class ContratoService {
     private boolean verificarPermisoCrear(Contrato contrato) {
         String rol = obtenerRolLogueado();
         LocalDate fecha = contrato.getFechaContrato();
-        boolean trabado = diaTrabado(fecha);
 
         if (ROL_JEFE.equals(rol)) {
             return false;
         }
 
         if (ROL_ADMINISTRADOR.equals(rol)) {
-            return trabado;
+            return yaEntregueMiCorte(fecha);
         }
 
         if (ROL_MOSTRADOR.equals(rol)) {
-            if (trabado) {
+            if (yaEntregueMiCorte(fecha)) {
                 throw new RuntimeException(
-                        "No puedes registrar este contrato: el corte del "
-                                + fecha + " ya fue entregado. "
+                        "No puedes registrar este contrato: ya entregaste tu corte "
+                                + "del " + fecha + ". "
                                 + "Pídele al jefe que lo reabra si hay que capturarlo.");
             }
             return false;
@@ -889,11 +895,36 @@ public class ContratoService {
     }
 
     /**
-     * Aplica la regla de negocio para modificar o eliminar un contrato:
+     * ¿Puedo mover dinero a esa FECHA? Pregunta de la persona, para cuando
+     * un contrato cambia de fecha al editarse.
+     */
+    private void verificarPuedoMoverDineroEn(LocalDate fecha, String accion) {
+        String rol = obtenerRolLogueado();
+
+        if (ROL_JEFE.equals(rol) || ROL_ADMINISTRADOR.equals(rol)) {
+            return;
+        }
+
+        if (ROL_MOSTRADOR.equals(rol)) {
+            if (yaEntregueMiCorte(fecha)) {
+                throw new RuntimeException(
+                        "No puedes " + accion + " este contrato: ya entregaste "
+                                + "tu corte del " + fecha + ".");
+            }
+            return;
+        }
+
+        throw new RuntimeException(
+                "Tu rol no tiene permiso para editar contratos.");
+    }
+
+    /**
+     * Regla para modificar o eliminar un contrato que YA existe:
      *
      *  - JEFE          -> puede siempre.
      *  - ADMINISTRADOR -> puede siempre.
-     *  - MOSTRADOR     -> solo si el día del contrato NO está trabado.
+     *  - MOSTRADOR     -> solo si el contrato NO está congelado dentro de
+     *                     un corte entregado.
      *
      * Si el rol no es ninguno de los conocidos, se bloquea por seguridad.
      *
@@ -907,18 +938,15 @@ public class ContratoService {
             return;
         }
 
-        // Mostrador: depende de si el día del contrato está trabado.
+        // Mostrador: depende de si ese contrato ya viaja en un corte.
         if (ROL_MOSTRADOR.equals(rol)) {
-            LocalDate fechaContrato = contrato.getFechaContrato();
-
-            if (diaTrabado(fechaContrato)) {
+            if (movimientoCongelado(contrato)) {
                 throw new RuntimeException(
-                        "No puedes " + accion + " este contrato: el corte del "
-                                + fechaContrato
-                                + " ya fue entregado. "
+                        "No puedes " + accion + " este contrato: ya se entregó "
+                                + "dentro de un corte de caja. "
                                 + "Pídele al jefe que lo reabra si hay que corregirlo.");
             }
-            return; // día abierto o reabierto: Mostrador sí puede.
+            return;
         }
 
         // Cualquier otro rol desconocido: se bloquea por seguridad.

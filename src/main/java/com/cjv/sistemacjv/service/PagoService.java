@@ -32,6 +32,7 @@ public class PagoService {
     private final ContratoRepository contratoRepository;
     private final EstadoContratoRepository estadoContratoRepository;
     private final CierreCajaRepository cierreCajaRepository;
+    private final CierreCajaService cierreCajaService;
     private final BitacoraLogger bitacoraLogger;
     private final PasswordEncoder passwordEncoder;
 
@@ -56,6 +57,7 @@ public class PagoService {
                        ContratoRepository contratoRepository,
                        EstadoContratoRepository estadoContratoRepository,
                        CierreCajaRepository cierreCajaRepository,
+                       CierreCajaService cierreCajaService,
                        BitacoraLogger bitacoraLogger,
                        PasswordEncoder passwordEncoder) {
         this.pagoRepository = pagoRepository;
@@ -63,6 +65,7 @@ public class PagoService {
         this.contratoRepository = contratoRepository;
         this.estadoContratoRepository = estadoContratoRepository;
         this.cierreCajaRepository = cierreCajaRepository;
+        this.cierreCajaService = cierreCajaService;
         this.bitacoraLogger = bitacoraLogger;
         this.passwordEncoder = passwordEncoder;
     }
@@ -82,7 +85,7 @@ public class PagoService {
      * esconder filtros en Angular es una cortina; esto es la chapa. Aunque
      * alguien manipule la dirección del navegador, el servidor manda.
      *
-     *  - MOSTRADOR : si el corte de hoy está trabado -> no ve NADA.
+     *  - MOSTRADOR : si YA entregó su corte de hoy -> no ve NADA.
      *                Si no, se le FUERZAN las fechas a hoy-hoy, sin importar
      *                lo que haya pedido. Puede buscar texto, pero solo dentro
      *                de los pagos de hoy.
@@ -123,8 +126,8 @@ public class PagoService {
         if (ROL_MOSTRADOR.equals(rol)) {
             LocalDate hoy = LocalDate.now();
 
-            // Corte del día ya entregado: no ve nada hasta que el jefe reabra.
-            if (diaTrabado(hoy)) {
+            // SU corte de hoy ya entregado: no ve nada hasta que el jefe reabra.
+            if (yaEntregueMiCorte(hoy)) {
                 return Page.<Pago>empty(pageable);
             }
 
@@ -158,8 +161,10 @@ public class PagoService {
     }
 
     public Pago guardarPago(Pago pago) {
-        // CANDADO: Mostrador no registra movimientos en días ya cerrados.
-        verificarPermisoSobreFecha(pago.getFechaPago(), "registrar");
+        // Un pago que todavía no existe no puede estar en ningún corte, así
+        // que aquí la pregunta correcta es la de la PERSONA: "¿ya entregué
+        // mi corte de ese día?".
+        verificarPuedoMoverDineroEn(pago.getFechaPago(), "registrar");
 
         // El orden importa: primero se define QUÉ es el movimiento,
         // porque de eso dependen todas las validaciones siguientes.
@@ -190,12 +195,16 @@ public class PagoService {
     public Optional<Pago> actualizarPago(Integer id, Pago datosPago) {
         return pagoRepository.findById(id).map(pago -> {
 
-            // CANDADO: se revisan las DOS fechas, la que el pago TENÍA y la que
-            // VA A QUEDAR. Si solo se revisara una, un Mostrador podría agarrar
-            // un pago de hoy y arrastrarlo a un día ya cerrado, metiéndose por
-            // la puerta de atrás a un corte que ya se entregó.
-            verificarPermisoSobreFecha(pago.getFechaPago(), "editar");
-            verificarPermisoSobreFecha(datosPago.getFechaPago(), "editar");
+            // Dos preguntas distintas, y las dos tienen que pasar:
+            //
+            //  1. ¿Este pago YA viaja en un corte entregado? Si sí, está
+            //     congelado para cualquier mostrador, incluido su dueño.
+            //  2. ¿Puedo mover dinero a la fecha NUEVA? Sin esto, Mostrador
+            //     agarraría un pago de hoy y lo arrastraría a un día que ya
+            //     entregó, metiéndose por la puerta de atrás a un corte
+            //     firmado.
+            verificarNoCongelado(pago, "editar");
+            verificarPuedoMoverDineroEn(datosPago.getFechaPago(), "mover a esa fecha");
 
             pago.setContrato(datosPago.getContrato());
             // Nota: quien cobró (usuario) NO se cambia al editar.
@@ -239,29 +248,31 @@ public class PagoService {
     public boolean eliminarPago(Integer id) {
         // Guardar referencia al contrato ANTES de borrar el pago.
         Optional<Pago> pagoOpt = pagoRepository.findById(id);
-        Contrato contratoAfectado = pagoOpt.map(Pago::getContrato).orElse(null);
-
-        // CANDADO: Mostrador no borra movimientos de días ya cerrados.
-        pagoOpt.ifPresent(p -> verificarPermisoSobreFecha(p.getFechaPago(), "eliminar"));
-
-        if (pagoRepository.existsById(id)) {
-            pagoRepository.deleteById(id);
-
-            bitacoraLogger.registrar(
-                    "pago",
-                    id,
-                    "ELIMINAR",
-                    "Pago #" + id + " eliminado"
-            );
-
-            // Después de eliminar, el contrato podría volver a deber.
-            if (contratoAfectado != null) {
-                actualizarEstadoContrato(contratoAfectado);
-            }
-
-            return true;
+        if (pagoOpt.isEmpty()) {
+            return false;
         }
-        return false;
+
+        Contrato contratoAfectado = pagoOpt.get().getContrato();
+
+        // Un pago ya entregado en un corte no se borra: el papel firmado
+        // dejaría de cuadrar con la pantalla.
+        verificarNoCongelado(pagoOpt.get(), "eliminar");
+
+        pagoRepository.deleteById(id);
+
+        bitacoraLogger.registrar(
+                "pago",
+                id,
+                "ELIMINAR",
+                "Pago #" + id + " eliminado"
+        );
+
+        // Después de eliminar, el contrato podría volver a deber.
+        if (contratoAfectado != null) {
+            actualizarEstadoContrato(contratoAfectado);
+        }
+
+        return true;
     }
 
     // ===================== DEVOLUCIONES (RN-11) =====================
@@ -430,64 +441,114 @@ public class PagoService {
     }
 
     /**
-     * Un día está TRABADO cuando ya tiene cierre de caja y ese cierre no
-     * está REABIERTO. Es la misma definición que usa ContratoService, para
-     * que las dos pantallas no se contradigan.
+     * ¿Ya entregué YO mi corte de ese día?
+     *
+     * Pregunta de la PERSONA. Que Adri haya entregado el suyo no detiene
+     * a Tete. Un corte REABIERTO no cuenta: está devuelto para corregir.
      */
-    private boolean diaTrabado(LocalDate fecha) {
+    private boolean yaEntregueMiCorte(LocalDate fecha) {
         if (fecha == null) {
             return false;
         }
+        Usuario yo = obtenerUsuarioLogueado();
+        return cierreCajaService.yaEntregoSuCorte(fecha, yo.getIdUsuario());
+    }
 
+    /**
+     * ¿Este pago está congelado por un corte?
+     *
+     * Pregunta del MOVIMIENTO, y congela para CUALQUIER mostrador, no solo
+     * para su dueño: si Tete ya entregó ese pago y firmó el papel, que Adri
+     * se lo cambie a las 6 le rompe el corte sin que ella se entere.
+     *
+     * AQUÍ VIVE LA FRONTERA:
+     *
+     *  - Pagos ANTERIORES al 9/09/2026 -> regla VIEJA, por fecha. Es la
+     *    única que los protege: nacieron antes de que existiera
+     *    cierre_caja_detalle y no tienen renglón ahí. Sin esto quedarían
+     *    descongelados de golpe, y entre ellos hay cobros reales de alumnos.
+     *
+     *  - De esa fecha en adelante -> regla NUEVA, por renglón en el detalle.
+     */
+    private boolean movimientoCongelado(Pago pago) {
+        if (pago == null || pago.getFechaPago() == null) {
+            return false;
+        }
+
+        if (pago.getFechaPago().isBefore(
+                CierreCajaService.INICIO_CORTES_POR_PERSONA)) {
+            return diaTrabadoReglaVieja(pago.getFechaPago());
+        }
+
+        return cierreCajaRepository.pagoEstaEnCorteQueTraba(pago.getIdPago());
+    }
+
+    /**
+     * La regla de antes: el día está trabado si tiene algún corte que trabe.
+     * Solo se usa para movimientos anteriores a la frontera.
+     */
+    private boolean diaTrabadoReglaVieja(LocalDate fecha) {
         List<CierreCaja> cortes =
                 cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
 
-        if (cortes.isEmpty()) {
-            return false; // ese día no tiene corte: está abierto.
-        }
-
-        // Basta con que UN corte trabe para que el día esté trabado.
-        // Mientras haya un solo corte por día, esto se comporta EXACTAMENTE
-        // igual que antes. Cuando existan varios (paso 3), esta regla se
-        // afina para que cada quien se trabe únicamente con el suyo.
         return cortes.stream()
                 .anyMatch(corte -> CierreCajaService.estadoTrabaElDia(corte.getEstado()));
     }
 
     /**
-     * Candado de verdad para registrar, editar y eliminar movimientos:
+     * ¿Puedo mover dinero en esa FECHA? Para crear un movimiento nuevo o
+     * cambiarle la fecha a uno que ya existe.
      *
-     *  - JEFE y ADMINISTRADOR -> siempre pueden, aunque el día esté cerrado.
-     *  - MOSTRADOR            -> solo si el día del movimiento NO está trabado.
+     *  - JEFE y ADMINISTRADOR -> siempre pueden.
+     *  - MOSTRADOR            -> solo si ÉL no ha entregado su corte de ese día.
      *  - Cualquier otro rol   -> bloqueado por seguridad.
      *
      * Se lanza IllegalArgumentException a propósito (y no RuntimeException):
      * el PagoController ya tiene un cazador para ese tipo que lo convierte en
      * un 400 con el mensaje legible, en lugar de un error 500 sin explicación.
-     *
-     * @param accion texto para el mensaje ("registrar" / "editar" / "eliminar").
      */
-    private void verificarPermisoSobreFecha(LocalDate fecha, String accion) {
+    private void verificarPuedoMoverDineroEn(LocalDate fecha, String accion) {
         String rol = obtenerRolLogueado();
 
-        // Jefe y Administrador: sin restricción.
         if (ROL_JEFE.equals(rol) || ROL_ADMINISTRADOR.equals(rol)) {
             return;
         }
 
-        // Mostrador: depende de si el día del movimiento está trabado.
         if (ROL_MOSTRADOR.equals(rol)) {
-            if (diaTrabado(fecha)) {
+            if (yaEntregueMiCorte(fecha)) {
                 throw new IllegalArgumentException(
-                        "No puedes " + accion + " este movimiento: el corte del "
-                                + fecha.format(FORMATO_FECHA)
-                                + " ya fue entregado. "
+                        "No puedes " + accion + " este movimiento: ya entregaste "
+                                + "tu corte del " + fecha.format(FORMATO_FECHA) + ". "
                                 + "Pídele al jefe que lo reabra si hay que corregirlo.");
             }
-            return; // día abierto o reabierto: Mostrador sí puede.
+            return;
         }
 
-        // Cualquier otro rol desconocido: se bloquea por seguridad.
+        throw new IllegalArgumentException(
+                "Tu rol no tiene permiso para " + accion + " pagos.");
+    }
+
+    /**
+     * ¿Este pago EN CONCRETO ya viaja en un corte entregado?
+     * Para editar y eliminar. Jefe y Administrador siguen pasando.
+     */
+    private void verificarNoCongelado(Pago pago, String accion) {
+        String rol = obtenerRolLogueado();
+
+        if (ROL_JEFE.equals(rol) || ROL_ADMINISTRADOR.equals(rol)) {
+            return;
+        }
+
+        if (ROL_MOSTRADOR.equals(rol)) {
+            if (movimientoCongelado(pago)) {
+                throw new IllegalArgumentException(
+                        "No puedes " + accion + " este movimiento: ya se entregó "
+                                + "dentro de un corte de caja. "
+                                + "Pídele al jefe que lo reabra si hay que corregirlo.");
+            }
+            return;
+        }
+
         throw new IllegalArgumentException(
                 "Tu rol no tiene permiso para " + accion + " pagos.");
     }

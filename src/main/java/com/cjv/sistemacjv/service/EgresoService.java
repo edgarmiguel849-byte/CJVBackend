@@ -44,15 +44,18 @@ public class EgresoService {
     private final UsuarioRepository usuarioRepository;
     private final BitacoraLogger bitacoraLogger;
     private final CierreCajaRepository cierreCajaRepository;
+    private final CierreCajaService cierreCajaService;
 
     public EgresoService(EgresoRepository egresoRepository,
                          UsuarioRepository usuarioRepository,
                          BitacoraLogger bitacoraLogger,
-                         CierreCajaRepository cierreCajaRepository) {
+                         CierreCajaRepository cierreCajaRepository,
+                         CierreCajaService cierreCajaService) {
         this.egresoRepository = egresoRepository;
         this.usuarioRepository = usuarioRepository;
         this.bitacoraLogger = bitacoraLogger;
         this.cierreCajaRepository = cierreCajaRepository;
+        this.cierreCajaService = cierreCajaService;
     }
 
     // ===================== MODO DE PANTALLA =====================
@@ -72,7 +75,7 @@ public class EgresoService {
         }
 
         if (ROL_MOSTRADOR.equals(rol)) {
-            boolean trabado = diaTrabado(hoy);
+            boolean trabado = yaEntregueMiCorte(hoy);
             return new ModoPantallaEgresos(
                     trabado ? MODO_CORTE_CERRADO : MODO_SOLO_HOY,
                     rol, hoy, trabado);
@@ -147,8 +150,8 @@ public class EgresoService {
         if (ROL_MOSTRADOR.equals(rol)) {
             LocalDate hoy = LocalDate.now();
 
-            // Corte del día ya entregado: no ve nada hasta que el jefe reabra.
-            if (diaTrabado(hoy)) {
+            // SU corte de hoy ya entregado: no ve nada hasta que el jefe reabra.
+            if (yaEntregueMiCorte(hoy)) {
                 return new PaginaEgresosDTO(Page.<Egreso>empty(pageable), BigDecimal.ZERO);
             }
 
@@ -192,10 +195,12 @@ public class EgresoService {
     }
 
     public Egreso guardarEgreso(Egreso egreso) {
-        // Se valida la fecha CON LA QUE VA A NACER. Sin esto, Mostrador
-        // podría capturar hoy un egreso fechado la semana pasada y meterle
-        // una salida de efectivo a un corte ya firmado.
-        verificarPermisoSobreFecha(egreso.getFechaEgreso(), "registrar");
+        // Un egreso que todavía no existe no puede estar dentro de ningún
+        // corte, así que aquí la pregunta correcta es la de la PERSONA:
+        // "¿ya entregué mi corte de ese día?". Sin esto, Mostrador podría
+        // capturar hoy un egreso fechado la semana pasada y meterle una
+        // salida de efectivo a un corte ya firmado.
+        verificarPuedoMoverDineroEn(egreso.getFechaEgreso(), "registrar");
 
         // El autor se toma del token, igual que en pagos y contratos.
         egreso.setUsuario(obtenerUsuarioLogueado());
@@ -216,13 +221,15 @@ public class EgresoService {
 
     public Optional<Egreso> actualizarEgreso(Integer id, Egreso datosEgreso) {
         return egresoRepository.findById(id).map(egreso -> {
-            // Se revisan las DOS fechas, no solo una:
-            //  - la que tiene guardada, para no tocar un corte ya cerrado;
-            //  - la que llega, para no mover el egreso HACIA un corte cerrado.
-            // Con revisar solo la vieja, Mostrador podría agarrar un egreso
-            // de hoy y empujarlo a un día ya entregado.
-            verificarPermisoSobreFecha(egreso.getFechaEgreso(), "editar");
-            verificarPermisoSobreFecha(datosEgreso.getFechaEgreso(), "mover a esa fecha");
+            // Dos preguntas distintas, y las dos tienen que pasar:
+            //
+            //  1. ¿Este egreso YA viaja en un corte entregado? Si sí, está
+            //     congelado para cualquier mostrador — incluido su dueño.
+            //  2. ¿Puedo mover dinero a la fecha NUEVA? Sin esto, Mostrador
+            //     agarraría un egreso de hoy y lo empujaría a un día que ya
+            //     entregó.
+            verificarNoCongelado(egreso, "editar");
+            verificarPuedoMoverDineroEn(datosEgreso.getFechaEgreso(), "mover a esa fecha");
 
             // Nota: el usuario que registró NO se cambia al editar.
             egreso.setConcepto(datosEgreso.getConcepto());
@@ -247,34 +254,43 @@ public class EgresoService {
     }
 
     public boolean eliminarEgreso(Integer id) {
-        if (egresoRepository.existsById(id)) {
-            egresoRepository.deleteById(id);
-
-            bitacoraLogger.registrar(
-                    "egreso",
-                    id,
-                    "ELIMINAR",
-                    "Egreso #" + id + " eliminado"
-            );
-
-            return true;
+        Optional<Egreso> encontrado = egresoRepository.findById(id);
+        if (encontrado.isEmpty()) {
+            return false;
         }
-        return false;
+
+        // CANDADO QUE ANTES NO EXISTÍA: eliminarEgreso() no revisaba nada.
+        // Un egreso ya entregado en un corte no se puede borrar: el papel
+        // firmado dejaría de cuadrar con la pantalla.
+        verificarNoCongelado(encontrado.get(), "eliminar");
+
+        egresoRepository.deleteById(id);
+
+        bitacoraLogger.registrar(
+                "egreso",
+                id,
+                "ELIMINAR",
+                "Egreso #" + id + " eliminado"
+        );
+
+        return true;
     }
 
     // ===================== CANDADOS =====================
 
     /**
-     * Regla para crear, editar o mover un egreso a una fecha:
+     * ¿Puedo mover dinero en esa FECHA?
+     *
+     * Es la pregunta de la PERSONA, para movimientos que todavía no
+     * existen (crear) o que van a cambiar de fecha (mover).
      *
      *  - JEFE y ADMINISTRADOR -> siempre pueden.
-     *  - MOSTRADOR            -> solo si ese día NO está trabado.
+     *  - MOSTRADOR            -> solo si ÉL no ha entregado su corte de
+     *                            ese día. Que Adri ya haya entregado el
+     *                            suyo no lo detiene.
      *  - Rol desconocido      -> bloqueado.
-     *
-     * Es la misma regla que ContratoService.verificarPermisoModificar(),
-     * porque un egreso y un contrato le pegan al mismo corte.
      */
-    private void verificarPermisoSobreFecha(LocalDate fecha, String accion) {
+    private void verificarPuedoMoverDineroEn(LocalDate fecha, String accion) {
         String rol = obtenerRolLogueado();
 
         if (ROL_JEFE.equals(rol) || ROL_ADMINISTRADOR.equals(rol)) {
@@ -282,13 +298,13 @@ public class EgresoService {
         }
 
         if (ROL_MOSTRADOR.equals(rol)) {
-            if (diaTrabado(fecha)) {
+            if (yaEntregueMiCorte(fecha)) {
                 throw new RuntimeException(
-                        "No puedes " + accion + " este egreso: el corte del "
-                                + fecha + " ya fue entregado. "
+                        "No puedes " + accion + " este egreso: ya entregaste tu "
+                                + "corte del " + fecha + ". "
                                 + "Pídele al jefe que lo reabra si hay que corregirlo.");
             }
-            return; // día abierto o reabierto: Mostrador sí puede.
+            return;
         }
 
         throw new RuntimeException(
@@ -296,33 +312,84 @@ public class EgresoService {
     }
 
     /**
-     * Un día está TRABADO cuando tiene al menos un corte y ese corte no
-     * está REABIERTO.
+     * ¿Este egreso EN CONCRETO ya viaja en un corte entregado?
      *
-     * Se pregunta por TODOS los cortes de la fecha, no por uno solo: un día
-     * puede tener varios (cada persona entrega el suyo, y el Administrativo
-     * puede hacer más de uno). Con un solo corte por día — como hoy — el
-     * resultado es idéntico al de antes.
+     * Es la pregunta del MOVIMIENTO, para editar y eliminar. Y a diferencia
+     * de la de arriba, congela para CUALQUIER mostrador, no solo para su
+     * dueño: si Tete ya entregó ese egreso y firmó el papel, que Adri se lo
+     * cambie a las 6 de la tarde le rompe el corte y ella ni se entera.
      *
-     * Qué estados traban NO se decide aquí: se le pregunta a
-     * CierreCajaService.estadoTrabaElDia(), para que esa regla exista
-     * escrita en un solo lugar de todo el sistema.
+     * Jefe y Administrador siguen pasando, como en todo el sistema.
      */
-    private boolean diaTrabado(LocalDate fecha) {
+    private void verificarNoCongelado(Egreso egreso, String accion) {
+        String rol = obtenerRolLogueado();
+
+        if (ROL_JEFE.equals(rol) || ROL_ADMINISTRADOR.equals(rol)) {
+            return;
+        }
+
+        if (ROL_MOSTRADOR.equals(rol)) {
+            if (movimientoCongelado(egreso)) {
+                throw new RuntimeException(
+                        "No puedes " + accion + " este egreso: ya se entregó "
+                                + "dentro de un corte de caja. "
+                                + "Pídele al jefe que lo reabra si hay que corregirlo.");
+            }
+            return;
+        }
+
+        throw new RuntimeException(
+                "Tu rol no tiene permiso para " + accion + " egresos.");
+    }
+
+    /**
+     * ¿Ya entregué YO mi corte de ese día?
+     *
+     * Un corte REABIERTO no cuenta: está devuelto justo para corregirlo.
+     */
+    private boolean yaEntregueMiCorte(LocalDate fecha) {
         if (fecha == null) {
             return false;
         }
+        Usuario yo = obtenerUsuarioLogueado();
+        return cierreCajaService.yaEntregoSuCorte(fecha, yo.getIdUsuario());
+    }
 
+    /**
+     * ¿Este egreso está congelado por un corte?
+     *
+     * AQUÍ VIVE LA FRONTERA:
+     *
+     *  - Egresos ANTERIORES al 9/09/2026 -> regla VIEJA, por fecha. Es la
+     *    única que los protege: nacieron antes de que existiera
+     *    cierre_caja_detalle y no tienen renglón ahí. Sin esto quedarían
+     *    descongelados de golpe, y entre ellos hay movimientos reales.
+     *
+     *  - De esa fecha en adelante -> regla NUEVA, por renglón en el
+     *    detalle. Es la que permite que el corte de Tete no congele lo
+     *    de Adri.
+     */
+    private boolean movimientoCongelado(Egreso egreso) {
+        if (egreso == null || egreso.getFechaEgreso() == null) {
+            return false;
+        }
+
+        if (egreso.getFechaEgreso().isBefore(
+                CierreCajaService.INICIO_CORTES_POR_PERSONA)) {
+            return diaTrabadoReglaVieja(egreso.getFechaEgreso());
+        }
+
+        return cierreCajaRepository.egresoEstaEnCorteQueTraba(egreso.getIdEgreso());
+    }
+
+    /**
+     * La regla de antes: el día está trabado si tiene algún corte que trabe.
+     * Solo se usa para movimientos anteriores a la frontera.
+     */
+    private boolean diaTrabadoReglaVieja(LocalDate fecha) {
         List<CierreCaja> cortes =
                 cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
 
-        if (cortes.isEmpty()) {
-            return false; // ese día no tiene corte: está abierto.
-        }
-
-        // Basta con que UN corte trabe para que el día esté trabado.
-        // En el paso 3 esta regla se afina para que cada quien se trabe
-        // únicamente con el suyo.
         return cortes.stream()
                 .anyMatch(corte -> CierreCajaService.estadoTrabaElDia(corte.getEstado()));
     }
