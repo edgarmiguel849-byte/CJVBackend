@@ -22,8 +22,22 @@ public interface ContratoRepository extends JpaRepository<Contrato, Integer> {
     List<Contrato> findByOrdenTrabajo_IdOrdenTrabajoOrderByNumeroListaAsc(Integer idOrdenTrabajo);
 
     // Contratos firmados dentro de un rango de fechas (para comisionar sus anticipos)
+    // Contratos firmados dentro de un rango de fechas (para comisionar sus anticipos)
     List<Contrato> findByActivoTrueAndFechaContratoBetween(LocalDate desde, LocalDate hasta);
 
+    /**
+     * Los contratos que UNA persona capturó en UN día.
+     *
+     * Del contrato al corte solo viaja el ANTICIPO: es el dinero que entró
+     * al cajón el día que se firmó. El total del contrato no, porque el
+     * resto se cobra después en abonos.
+     *
+     * OJO: filtra por quien lo CAPTURÓ (contrato.usuario), no por la
+     * vendedora de la O.T. Son cosas distintas — la comisión es de la
+     * vendedora, pero el dinero lo entrega quien lo recibió.
+     */
+    List<Contrato> findByActivoTrueAndFechaContratoAndUsuario_IdUsuarioOrderByIdContratoAsc(
+            LocalDate fecha, Integer idUsuario);
     // Devuelve el numero_lista más alto usado en esa O.T.
     // Sirve para asignar el siguiente consecutivo automáticamente.
     // Regresa null si la O.T. todavía no tiene contratos.

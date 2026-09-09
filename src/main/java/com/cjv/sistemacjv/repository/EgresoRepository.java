@@ -21,6 +21,16 @@ public interface EgresoRepository extends JpaRepository<Egreso, Integer> {
     List<Egreso> findByActivoTrueAndFechaEgreso(LocalDate fecha);
 
     /**
+     * Los egresos que UNA persona capturó en UN día.
+     *
+     * Cada quien entrega lo que recibió MENOS lo que sacó. Si Tete pagó una
+     * mensajería de su cajón, ese dinero ya no está y tiene que salir de su
+     * corte, no del de Adri.
+     */
+    List<Egreso> findByActivoTrueAndFechaEgresoAndUsuario_IdUsuarioOrderByIdEgresoAsc(
+            LocalDate fecha, Integer idUsuario);
+
+    /**
      * Búsqueda paginada para la pantalla de Egresos.
      * Los tres filtros son opcionales: si llegan en null, no se aplican.
      * El texto se compara contra concepto, comentarios y quién lo registró.

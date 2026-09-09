@@ -17,8 +17,21 @@ public interface PagoRepository extends JpaRepository<Pago, Integer> {
     List<Pago> findByContrato_IdContratoAndActivoTrue(Integer idContrato);
 
     // Pagos cobrados dentro de un rango de fechas (para el reporte de comisiones)
+    // Pagos cobrados dentro de un rango de fechas (para el reporte de comisiones)
     List<Pago> findByActivoTrueAndFechaPagoBetween(LocalDate desde, LocalDate hasta);
 
+    /**
+     * Los pagos que UNA persona cobró en UN día.
+     *
+     * Es la base del corte individual: cada quien entrega el dinero que él
+     * recibió. El de arriba trae el día completo de todos y ese se queda
+     * para Reportes, que es del Jefe.
+     *
+     * El orden por id es el orden en que se capturaron, que es como se leen
+     * en la hoja física.
+     */
+    List<Pago> findByActivoTrueAndFechaPagoAndUsuario_IdUsuarioOrderByIdPagoAsc(
+            LocalDate fecha, Integer idUsuario);
     /**
      * Búsqueda paginada para la pantalla de Pagos.
      * Los tres filtros son opcionales: si llegan en null, no se aplican.
