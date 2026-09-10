@@ -1,6 +1,7 @@
 package com.cjv.sistemacjv.service;
 
 import com.cjv.sistemacjv.dto.CorteDePersonaDTO;
+import com.cjv.sistemacjv.dto.EstadoDelDiaDTO;
 import com.cjv.sistemacjv.entity.CierreCaja;
 import com.cjv.sistemacjv.entity.CierreCajaDetalle;
 import com.cjv.sistemacjv.entity.Usuario;
@@ -17,9 +18,14 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * El corte de caja: cada persona cuenta SU efectivo y entrega SU corte;
@@ -79,6 +85,22 @@ public class CierreCajaService {
     private static final DateTimeFormatter FORMATO_FECHA =
             DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
+    /**
+     * Del más VIEJO al más NUEVO dentro de un mismo día.
+     *
+     * Ordena por fecha_hora_entrega, y cuando esa hora es null cae al id.
+     * El null aparece en los cortes anteriores a que existiera la columna:
+     * no se sabe su hora y no se inventa, así que para ellos el
+     * autoincremento es la única pista de orden que hay. Se mandan al
+     * principio a propósito: son los más viejos.
+     */
+    private static final Comparator<CierreCaja> POR_MOMENTO_DE_ENTREGA =
+            Comparator
+                    .comparing(CierreCaja::getFechaHoraEntrega,
+                            Comparator.nullsFirst(Comparator.naturalOrder()))
+                    .thenComparing(CierreCaja::getIdCierreCaja,
+                            Comparator.nullsFirst(Comparator.naturalOrder()));
+
     private final CierreCajaRepository cierreCajaRepository;
     private final CierreCajaDetalleRepository detalleRepository;
     private final UsuarioRepository usuarioRepository;
@@ -117,22 +139,129 @@ public class CierreCajaService {
     /**
      * TODOS los cortes de un día. Es la consulta buena ahora que un día
      * puede tener varios.
+     *
+     * Salen del más viejo al más nuevo por hora de entrega. Es el orden en
+     * que el Jefe los va a ver en su lista, y el orden en que ocurrieron.
      */
     public List<CierreCaja> listarPorFecha(LocalDate fecha) {
-        return cierreCajaRepository.findAllByFechaCierreOrderByIdCierreCajaAsc(fecha);
+        return cierreCajaRepository
+                .findAllByFechaCierreOrderByIdCierreCajaAsc(fecha)
+                .stream()
+                .sorted(POR_MOMENTO_DE_ENTREGA)
+                .toList();
     }
 
     /**
-     * PROVISIONAL: el primer corte de un día, para que la pantalla actual
-     * siga funcionando mientras se rehace.
+     * PROVISIONAL: un corte suelto del día, para que sobreviva la pantalla
+     * vieja mientras se rehace.
      *
-     * Con un solo corte al día se comporta igual que siempre. Con varios
-     * devuelve el primero, que ya no es "el corte del día" sino uno de
-     * ellos — la pantalla nueva (paso 3d) usa listarPorFecha() y muestra
-     * todos. Se deja para no romper el controlador de un jalón.
+     * Devuelve el MÁS RECIENTE, no el primero. Antes daba el primero, que
+     * con dos cortes en un día es el equivocado: el dinero que está en el
+     * cajón ahorita corresponde al último, no al de la mañana.
+     *
+     * Aun así sigue siendo mentira cuando hay varios, porque enseña UNO
+     * como si fuera "el corte del día". La pantalla del Jefe usa
+     * listarPorFecha() y los muestra todos.
      */
     public Optional<CierreCaja> buscarPorFecha(LocalDate fecha) {
-        return listarPorFecha(fecha).stream().findFirst();
+        List<CierreCaja> delDia = listarPorFecha(fecha);
+        return delDia.isEmpty()
+                ? Optional.empty()
+                : Optional.of(delDia.get(delDia.size() - 1));
+    }
+
+    /**
+     * El ÚLTIMO corte entregado de esta persona en este día, con sus
+     * cifras congeladas.
+     *
+     * Es lo que necesita la pantalla de quien entrega: si el Administrador
+     * entregó a mediodía y otra vez en la tarde, el acta que le toca ver
+     * al recargar es la de la tarde.
+     *
+     * Un corte REABIERTO no cuenta como entregado: está devuelto para
+     * corregirse, así que quien pregunte debe recibir vacío y volver al
+     * modo de captura.
+     */
+    public Optional<CierreCaja> buscarUltimoDePersona(LocalDate fecha, Integer idUsuario) {
+        return cierreCajaRepository
+                .findAllByFechaCierreAndUsuario_IdUsuarioOrderByIdCierreCajaAsc(fecha, idUsuario)
+                .stream()
+                .filter(c -> estadoTrabaElDia(c.getEstado()))
+                .max(POR_MOMENTO_DE_ENTREGA);
+    }
+
+    /**
+     * EL SEMÁFORO DEL MES para el calendario del Jefe.
+     *
+     * Un renglón por día CON cortes. Los días sin ningún corte NO vienen:
+     * el navegador los pinta grises por ausencia, y así no viaja un mes
+     * lleno de renglones vacíos.
+     *
+     * La regla del color vive AQUÍ, no en el navegador, para que exista
+     * escrita en un solo lugar:
+     *   VERDE    -> todos autorizados.
+     *   AMARILLO -> unos sí y otros no, o hay alguno REABIERTO.
+     *   ROJO     -> hay cortes y ninguno autorizado.
+     *
+     * OJO CON LO QUE NO DICE: si alguien FALTÓ por entregar. El sistema no
+     * sabe quién trabajó cada día, así que un día con dos cortes se ve
+     * igual hayan trabajado dos personas o tres. Se decidió así para no
+     * inventar un módulo de asistencia.
+     */
+    public List<EstadoDelDiaDTO> estadosDelMes(int anio, int mes) {
+        if (mes < 1 || mes > 12) {
+            throw new IllegalArgumentException(
+                    "El mes debe ir del 1 al 12. Llegó: " + mes);
+        }
+        if (anio < 2000 || anio > 2200) {
+            throw new IllegalArgumentException(
+                    "Año fuera de rango: " + anio);
+        }
+
+        YearMonth deQueMes = YearMonth.of(anio, mes);
+        LocalDate primero = deQueMes.atDay(1);
+        LocalDate ultimo = deQueMes.atEndOfMonth();
+
+        // Todos los cortes del mes en UNA consulta. Pedir día por día
+        // serían 30 viajes a la base para pintar una pantalla.
+        Map<LocalDate, List<CierreCaja>> porDia = cierreCajaRepository
+                .findAllByFechaCierreBetweenOrderByFechaCierreAsc(primero, ultimo)
+                .stream()
+                .collect(Collectors.groupingBy(CierreCaja::getFechaCierre));
+
+        List<EstadoDelDiaDTO> estados = new ArrayList<>();
+
+        for (Map.Entry<LocalDate, List<CierreCaja>> dia : porDia.entrySet()) {
+            List<CierreCaja> cortes = dia.getValue();
+
+            int total = cortes.size();
+
+            int autorizados = (int) cortes.stream()
+                    .filter(c -> ESTADO_AUTORIZADO.equals(c.getEstado()))
+                    .count();
+
+            boolean hayReabiertos = cortes.stream()
+                    .anyMatch(c -> ESTADO_REABIERTO.equals(c.getEstado()));
+
+            String color;
+            if (hayReabiertos) {
+                // Un corte devuelto para corregir es trabajo pendiente,
+                // aunque todos los demás del día ya estén firmados.
+                color = EstadoDelDiaDTO.AMARILLO;
+            } else if (autorizados == total) {
+                color = EstadoDelDiaDTO.VERDE;
+            } else if (autorizados == 0) {
+                color = EstadoDelDiaDTO.ROJO;
+            } else {
+                color = EstadoDelDiaDTO.AMARILLO;
+            }
+
+            estados.add(new EstadoDelDiaDTO(
+                    dia.getKey(), color, total, autorizados, hayReabiertos));
+        }
+
+        estados.sort(Comparator.comparing(EstadoDelDiaDTO::getFecha));
+        return estados;
     }
 
     /** Historial completo, del más reciente al más viejo. */
@@ -281,6 +410,14 @@ public class CierreCajaService {
         cierre.setComentarios(comentarioLimpio.isEmpty() ? null : comentarioLimpio);
         cierre.setEstado(ESTADO_ENVIADO);
         cierre.setActivo(true);
+
+        // El momento en que se entregó. OJO: fecha es el DÍA que se está
+        // cortando y puede ser de ayer; esto es el reloj de AHORA, cuando
+        // se contó el dinero. Son cosas distintas a propósito.
+        //
+        // En una corrección se pisa la hora vieja: el acta que vale es la
+        // corregida, y su hora es la de este reenvío.
+        cierre.setFechaHoraEntrega(LocalDateTime.now());
 
         // Al reenviar, la firma vieja del jefe ya no aplica: se limpia.
         cierre.setUsuarioAutoriza(null);

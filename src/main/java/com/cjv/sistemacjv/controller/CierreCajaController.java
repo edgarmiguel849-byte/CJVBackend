@@ -1,6 +1,7 @@
 package com.cjv.sistemacjv.controller;
 
 import com.cjv.sistemacjv.dto.CorteDePersonaDTO;
+import com.cjv.sistemacjv.dto.EstadoDelDiaDTO;
 import com.cjv.sistemacjv.entity.CierreCaja;
 import com.cjv.sistemacjv.entity.Usuario;
 import com.cjv.sistemacjv.repository.UsuarioRepository;
@@ -47,11 +48,31 @@ public class CierreCajaController {
     }
 
     /**
+     * EL SEMÁFORO DEL MES: un renglón por día CON cortes, con su color.
+     *
+     * Es lo que pinta el calendario del Jefe. Los días sin ningún corte NO
+     * vienen en la lista: el navegador los deja grises por ausencia, y así
+     * no viaja un mes lleno de renglones vacíos.
+     *
+     * Solo el Jefe: es la vista de supervisión de todos los cortes.
+     */
+    @GetMapping("/estados-del-mes")
+    @PreAuthorize("hasRole('JEFE')")
+    public List<EstadoDelDiaDTO> estadosDelMes(
+            @RequestParam int anio,
+            @RequestParam int mes
+    ) {
+        return cierreCajaService.estadosDelMes(anio, mes);
+    }
+
+    /**
      * TODOS los cortes de un día, cada uno con su dueño y su estado.
      *
      * Es la vista del Jefe: un día puede tener el de Tete entregado, el de
      * Adri abierto y dos del Administrativo. Reemplaza a /por-fecha, que
      * solo alcanzaba a devolver uno.
+     *
+     * Salen en el orden en que se entregaron, del más viejo al más nuevo.
      */
     @GetMapping("/del-dia")
     @PreAuthorize("hasRole('JEFE')")
@@ -79,6 +100,34 @@ public class CierreCajaController {
                 fecha, yo.getIdUsuario(), yo.getNombreUsuario());
     }
 
+    /**
+     * MI corte ya entregado de ese día, con sus cifras congeladas.
+     *
+     * Devuelve 204 si todavía no entrego. Es lo que la pantalla necesita
+     * para pintar el panel de "ya entregado" y la hoja impresa: el
+     * efectivo esperado, lo contado, la diferencia y quién firma.
+     *
+     * Cuando hay varios míos ese día — el Administrador puede entregar los
+     * que necesite — devuelve el MÁS RECIENTE. Antes daba el primero, que
+     * es el equivocado: el dinero que está en el cajón ahorita corresponde
+     * al último, no al de la mañana.
+     *
+     * Un corte REABIERTO no cuenta como entregado: está devuelto para
+     * corregirse, así que la pantalla debe volver al modo de captura. El
+     * filtro vive en el servicio.
+     */
+    @GetMapping("/mi-corte-entregado")
+    public ResponseEntity<CierreCaja> miCorteEntregado(
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate fecha
+    ) {
+        Usuario yo = obtenerUsuarioLogueado();
+
+        return cierreCajaService
+                .buscarUltimoDePersona(fecha, yo.getIdUsuario())
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.noContent().build());
+    }
+
     /** ¿Ya entregué mi corte de ese día? Para que la pantalla sepa qué pintar. */
     @GetMapping("/ya-entregue")
     public boolean yaEntregue(
@@ -89,13 +138,13 @@ public class CierreCajaController {
     }
 
     /**
-     * OJO - PROVISIONAL. Devuelve el PRIMER corte del día.
+     * OJO - PROVISIONAL. Devuelve UN corte del día (el más reciente).
      *
      * Con un solo corte al día se comporta como siempre, pero con varios
-     * MIENTE: le enseña a Adri el corte de Tete. Sigue aquí nada más para
-     * que la pantalla vieja no truene mientras se rehace (3d-3).
+     * MIENTE: enseña uno como si fuera "el corte del día". Sigue aquí nada
+     * más por si algo viejo lo llama; la pantalla nueva usa /del-dia.
      *
-     * Cuando la pantalla nueva esté lista, se borra junto con
+     * Ya nadie lo usa desde el frontend. Se puede borrar junto con
      * CierreCajaService.buscarPorFecha().
      */
     @Deprecated

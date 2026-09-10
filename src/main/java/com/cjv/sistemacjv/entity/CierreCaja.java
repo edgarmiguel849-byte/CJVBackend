@@ -23,6 +23,21 @@ public class CierreCaja {
     @Column(name = "fecha_cierre", nullable = false)
     private LocalDate fechaCierre;
 
+    /**
+     * Momento exacto en que se entregó el corte.
+     *
+     * fechaCierre es solo el DÍA. Con el corte por persona, el
+     * Administrador puede entregar dos el mismo día, y sin esto no hay
+     * forma de saber cuál fue primero: la lista del Jefe se vería como
+     * dos renglones idénticos y /mi-corte-entregado tendría que adivinar
+     * el más reciente ordenando por el autoincremento del id.
+     *
+     * NULL en los cortes anteriores a esta columna: no sabemos su hora y
+     * no se inventa. Quien la lea tiene que estar listo para el null.
+     */
+    @Column(name = "fecha_hora_entrega")
+    private LocalDateTime fechaHoraEntrega;
+
     @Column(name = "total_cierre", nullable = false)
     private BigDecimal totalCierre;
 
@@ -87,6 +102,14 @@ public class CierreCaja {
 
     public void setFechaCierre(LocalDate fechaCierre) {
         this.fechaCierre = fechaCierre;
+    }
+
+    public LocalDateTime getFechaHoraEntrega() {
+        return fechaHoraEntrega;
+    }
+
+    public void setFechaHoraEntrega(LocalDateTime fechaHoraEntrega) {
+        this.fechaHoraEntrega = fechaHoraEntrega;
     }
 
     public BigDecimal getTotalCierre() {
